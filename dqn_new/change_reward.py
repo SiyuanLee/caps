@@ -15,14 +15,13 @@ __ple_dir = '/'.join(str.split(__file_path, '/')[:-3]) + '/'
 __cur_dir = '/'.join(str.split(__file_path, '/')[:-1]) + '/'
 sys.path.append(__ple_dir)
 
-import dqn
+import dqn_current
 from dqn_utils import *
-from option import PrimitiveOption, Source
+from atari_wrappers import *
 
 
-def transfer_model(img_in, num_actions, num_options, scope, reuse=False, omega_stop=False, termination_stop=False, no_share_para=False):
+def atari_model(img_in, num_actions, scope, reuse=False):
     # as described in https://storage.googleapis.com/deepmind-data/assets/papers/DeepMindNature14236Paper.pdf
-    # added some option-critic flavor
     with tf.variable_scope(scope, reuse=reuse):
         out = img_in
         with tf.variable_scope("convnet"):
@@ -31,36 +30,14 @@ def transfer_model(img_in, num_actions, num_options, scope, reuse=False, omega_s
             out = layers.convolution2d(out, num_outputs=64, kernel_size=4, stride=2, activation_fn=tf.nn.relu)
             out = layers.convolution2d(out, num_outputs=64, kernel_size=3, stride=1, activation_fn=tf.nn.relu)
         out = layers.flatten(out)
-        with tf.variable_scope("feature"):
+        with tf.variable_scope("action_value"):
             out = layers.fully_connected(out, num_outputs=512,         activation_fn=tf.nn.relu)
-        with tf.variable_scope("option_value"):
-            omega_in = tf.stop_gradient(out) if omega_stop else out
-            q_omega = layers.fully_connected(omega_in, num_outputs=num_options, activation_fn=None)
-        with tf.variable_scope("termination_prob"):
-            term_in = tf.stop_gradient(out) if termination_stop else out
-            term_prob = layers.fully_connected(term_in, num_outputs=num_options, activation_fn=tf.sigmoid)
-        if not no_share_para:
-            with tf.variable_scope("action_value"):
-                q_value = layers.fully_connected(out, num_outputs=num_actions, activation_fn=None)
-        else:  # no_share_para = True
-            out = img_in
-            with tf.variable_scope("convnet_q"):
-                # original architecture
-                out = layers.convolution2d(out, num_outputs=32, kernel_size=8, stride=4, activation_fn=tf.nn.relu)
-                out = layers.convolution2d(out, num_outputs=64, kernel_size=4, stride=2, activation_fn=tf.nn.relu)
-                out = layers.convolution2d(out, num_outputs=64, kernel_size=3, stride=1, activation_fn=tf.nn.relu)
-            out = layers.flatten(out)
-            with tf.variable_scope("feature_q"):
-                out = layers.fully_connected(out, num_outputs=512, activation_fn=tf.nn.relu)
-            with tf.variable_scope("action_value_q"):
-                q_value = layers.fully_connected(out, num_outputs=num_actions, activation_fn=None)
+            out = layers.fully_connected(out, num_outputs=num_actions, activation_fn=None)
 
-        return q_value, q_omega, term_prob
+        return out
 
-
-def transfer_learn(env,
+def atari_learn(env,
                 env_test,
-                env_test1,
                 session,
                 num_timesteps=2e7,
                 learning_rate=None,
@@ -88,11 +65,8 @@ def transfer_learn(env,
     grad_norm_clipping = 10
     eval_obs_array = None
     room_q_interval = 1e5
-    epoch_size = 5e4
+    epoch_size = 5e3
     config_name = None
-    transfer_config = None
-    source_dirs = []
-    #term_optimizer =
 
 
     if dqn_config:
@@ -126,17 +100,6 @@ def transfer_learn(env,
             epoch_size = dqn_config['epoch_size']
         if dqn_config.has_key('config_name'):
             config_name = dqn_config['config_name']
-        if dqn_config.has_key('transfer_config'):
-            transfer_config = dqn_config['transfer_config']
-
-    if transfer_config:
-        if transfer_config.has_key('source_dirs'):
-            source_dirs = transfer_config['source_dirs']
-        if transfer_config.has_key('term_optimizer'):
-            term_optimizer = transfer_config['term_optimizer']
-
-    if len(source_dirs) == 0:
-        print('no source policies provided! check your config.')
 
 
     # log_dir = __cur_dir + 'logs/' + config_name + '_' + time + '/'
@@ -154,9 +117,6 @@ def transfer_learn(env,
         pkl_dir = log_dir + 'pkl/'
         if not os.path.exists(pkl_dir):
             os.makedirs(pkl_dir)
-        tfb_dir = log_dir + 'tfb/'
-        if not os.path.exists(tfb_dir):
-            os.makedirs(tfb_dir)
     else:
         log_dir = None
         print("config_name not specified! info may not be logged in this run.")
@@ -176,21 +136,6 @@ def transfer_learn(env,
         ],
             outside_value=5e-5 * lr_multiplier)
 
-    lr_schedule_omega = PiecewiseSchedule([
-            (0,                   2e-4 ),
-            (num_iterations / 2, 1e-4 ),
-            (num_iterations *3 / 4,  5e-5 ),
-        ],
-            outside_value=5e-5 )
-
-    lr_multiplier_term = 1.0
-    lr_schedule_term = PiecewiseSchedule([
-            (0,                   2.5e-4 * lr_multiplier_term),
-            (num_iterations / 10, 1e-4 * lr_multiplier_term),
-            (num_iterations / 2,  5e-5 * lr_multiplier_term),
-        ],
-            outside_value=5e-5 * lr_multiplier_term)
-
     if exploration != None:
         exploration_schedule = exploration
     else:
@@ -202,50 +147,24 @@ def transfer_learn(env,
             ], outside_value=0.01
         )
 
-    optimizer = dqn.OptimizerSpec(
+    optimizer = dqn_current.OptimizerSpec(
         constructor=tf.train.AdamOptimizer,
         kwargs=dict(epsilon=1e-4),
         lr_schedule=lr_schedule
     )
 
-    optimizer_omega = dqn.OptimizerSpec(
-        constructor=tf.train.AdamOptimizer,
-        kwargs=dict(epsilon=1e-4),  # not for SGD
-        #kwargs=dict(),  # for SGD
-        lr_schedule=lr_schedule_omega
-    )
-
-    optimizer_term = dqn.OptimizerSpec(
-        constructor=tf.train.GradientDescentOptimizer,
-        #kwargs=dict(epsilon=1e-4), not for SGD
-        kwargs=dict(),
-        lr_schedule=lr_schedule_term
-    )
-
-
     def stopping_criterion(env, t):        # notice that here t is the number of steps of the wrapped env,
 
         # which is different from the number of steps in the underlying env
-        #return get_wrapper_by_name(env, "Monitor").get_total_steps() >= num_timesteps
-	return False
-
-    # init sources and primitive options
-    options = []
-    options += [Source(dqn_config, env, tf.train.get_checkpoint_state(d)) for d in source_dirs]
-    for action in range(env.action_space.n):
-        options.append(PrimitiveOption(action))
+        return get_wrapper_by_name(env, "Monitor").get_total_steps() >= num_timesteps
 
 
-    dqn.learn(
+    dqn_current.learn(
         env,
         env_test,
-        env_test1,
-        transfer_model,
-        optimizer,
-        optimizer_omega,
-        optimizer_term,
+        q_func=atari_model,
+        optimizer_spec=optimizer,
         session=session,
-        options=options,
         exploration=exploration_schedule,
         stopping_criterion=stopping_criterion,
         replay_buffer_size=replay_buffer_size,
@@ -259,13 +178,10 @@ def transfer_learn(env,
         eval_obs_array=eval_obs_array,
         room_q_interval=room_q_interval,
         epoch_size=epoch_size,
-        log_dir=log_dir,
-        transfer_config=transfer_config
+        log_dir=log_dir
     )
     env.close()
     env_test.close()
-    env_test1.close()
-    # TODO: close tensorflow sessions
 
 def get_available_gpus():
     from tensorflow.python.client import device_lib
@@ -278,7 +194,7 @@ def set_global_seeds(i):
     except ImportError:
         pass
     else:
-        tf.set_random_seed(i) 
+        tf.set_random_seed(i)
     np.random.seed(i)
     random.seed(i)
 
@@ -292,11 +208,24 @@ def get_session():
     print("AVAILABLE GPUS: ", get_available_gpus())
     return session
 
+def get_env(task, seed):
+    env_id = task.env_id
+
+    env = gym.make(env_id)
+
+    set_global_seeds(seed)
+    env.seed(seed)
+
+    expt_dir = 'tmp/'
+    env = wrappers.Monitor(env, osp.join(expt_dir, "gym"), force=True)
+    env = wrap_deepmind(env)
+
+    return env
 
 def wrap_env(env, seed):  # non-atari
     env.seed(seed)
 
-    expt_dir = '~/tmp/transfer-gym/'
+    expt_dir = 'tmp/'
     env = wrappers.Monitor(env, osp.join(expt_dir, "gym"), force=True)
 
 
@@ -333,8 +262,6 @@ def main():
     env = ProcessFrame(env)
     env_test = gym.make('MonsterKong-v0')
     env_test = ProcessFrame(env_test)
-    env_test1 = gym.make('MonsterKong-v0')
-    env_test1 = ProcessFrame(env_test1)
 
     # Run training
     seed = 0 # Use a seed of zero (you may want to randomize the seed!)
@@ -351,13 +278,10 @@ def main():
         if dqn_config.has_key('additional_wrapper'):
             env = dqn_config['additional_wrapper'](env)
             env_test = dqn_config['additional_wrapper'](env_test)
-            env_test1 = dqn_config['additional_wrapper'](env_test1)
-
     env = wrap_env(env, seed)
     env_test = wrap_env(env_test, seed)
-    env_test1 = wrap_env(env_test1, seed)
     session = get_session()
-    transfer_learn(env, env_test, env_test1, session, num_timesteps=num_timesteps, dqn_config=dqn_config)
+    atari_learn(env, env_test, session, num_timesteps=num_timesteps, dqn_config=dqn_config)
 
 
 if __name__ == "__main__":
